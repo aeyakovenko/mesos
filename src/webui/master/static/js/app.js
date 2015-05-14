@@ -64,7 +64,7 @@
       paginationConfig.rotate = false;
 
       ZeroClipboard.setDefaults({
-        moviePath: '/static/obj/zeroclipboard-1.1.7.swf'
+        moviePath: 'static/obj/zeroclipboard-1.1.7.swf'
       });
     }])
     .filter('truncateMesosID', function() {
