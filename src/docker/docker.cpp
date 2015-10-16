@@ -553,6 +553,11 @@ Future<Option<int>> Docker::run(
   environmentVariables += "MESOS_SANDBOX=" + mappedDirectory + "\n";
   environmentVariables += "MESOS_CONTAINER_NAME=" + name + "\n";
 
+  Option<string> libprocessIP = os::getenv("LIBPROCESS_IP");
+  if (libprocessIP.isSome()) {
+    environmentVariables += "LIBPROCESS_IP=" + libprocessIP.get() + "\n";
+  }
+
   Try<string> environmentFile_ = os::mktemp();
   if (environmentFile_.isError()) {
     return Failure("Failed to create temporary docker environment "
