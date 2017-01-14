@@ -2027,6 +2027,11 @@ inverse_offer_framework_SOURCES = examples/inverse_offer_framework.cpp
 inverse_offer_framework_CPPFLAGS = $(MESOS_CPPFLAGS)
 inverse_offer_framework_LDADD = libmesos.la $(LDADD)
 
+check_PROGRAMS += soak-test-framework
+soak_test_framework_SOURCES = examples/soak_test_framework.cpp
+soak_test_framework_CPPFLAGS = $(MESOS_CPPFLAGS)
+soak_test_framework_LDADD = libmesos.la $(LDADD)
+
 check_PROGRAMS += load-generator-framework
 load_generator_framework_SOURCES = examples/load_generator_framework.cpp
 load_generator_framework_CPPFLAGS = $(MESOS_CPPFLAGS)
