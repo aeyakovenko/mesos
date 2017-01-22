@@ -404,7 +404,7 @@ protected:
         CHECK_NE(HealthCheck::COMMAND, task.health_check().type())
           << "Command health checks are not supported yet";
 
-        Try<Owned<checks::HealthChecker>> _checker =
+        Try<Owned<checks::HealthChecker>> _healthChecker =
           checks::HealthChecker::create(
               task.health_check(),
               launcherDirectory,
@@ -413,15 +413,15 @@ protected:
               None(),
               vector<string>());
 
-        if (_checker.isError()) {
+        if (_healthChecker.isError()) {
           // TODO(anand): Should we send a TASK_FAILED instead?
           LOG(ERROR) << "Failed to create health checker: "
-                     << _checker.error();
+                     << _healthChecker.error();
           __shutdown();
           return;
         }
 
-        checkers[taskId] = _checker.get();
+        healthCheckers[taskId] = _healthChecker.get();
       }
 
       // Currently, the Mesos agent does not expose the mapping from
@@ -620,10 +620,10 @@ protected:
 
     // If the task is health checked, stop the associated health checker
     // to avoid sending health updates after a terminal status update.
-    if (checkers.contains(taskId)) {
-      CHECK_NOTNULL(checkers.at(taskId).get());
-      checkers.at(taskId)->stop();
-      checkers.erase(taskId);
+    if (healthCheckers.contains(taskId)) {
+      CHECK_NOTNULL(healthCheckers.at(taskId).get());
+      healthCheckers.at(taskId)->stop();
+      healthCheckers.erase(taskId);
     }
 
     TaskState taskState;
@@ -698,10 +698,11 @@ protected:
     shuttingDown = true;
 
     // Stop health checking all tasks because we are shutting down.
-    foreach (const Owned<checks::HealthChecker>& checker, checkers.values()) {
-      checker->stop();
+    foreach (const Owned<checks::HealthChecker>& healthChecker,
+             healthCheckers.values()) {
+      healthChecker->stop();
     }
-    checkers.clear();
+    healthCheckers.clear();
 
     if (!launched) {
       __shutdown();
@@ -842,7 +843,7 @@ protected:
     //
     // TODO(alexr): Once we support `TASK_KILLING` in this executor,
     // consider sending health updates after `TASK_KILLING`.
-    if (!checkers.contains(healthStatus.task_id())) {
+    if (!healthCheckers.contains(healthStatus.task_id())) {
       return;
     }
 
@@ -1084,7 +1085,7 @@ private:
   // a `connected()` callback.
   Option<UUID> connectionId;
 
-  hashmap<TaskID, Owned<checks::HealthChecker>> checkers; // Health checkers.
+  hashmap<TaskID, Owned<checks::HealthChecker>> healthCheckers;
 };
 
 } // namespace internal {
