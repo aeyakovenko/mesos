@@ -43,6 +43,7 @@
 #include <stout/os.hpp>
 #include <stout/uuid.hpp>
 
+#include "checks/checker.hpp"
 #include "checks/health_checker.hpp"
 
 #include "common/http.hpp"
@@ -399,6 +400,29 @@ protected:
 
       pending.pop_front();
 
+      if (task.has_check()) {
+        // TODO(alexr): Add support for command checks.
+        CHECK_NE(CheckInfo::COMMAND, task.check().type())
+          << "Command checks are not supported yet";
+
+        Try<Owned<checks::Checker>> _checker =
+          checks::Checker::create(
+              task.check(),
+              defer(self(), &Self::taskCheckUpdated, lambda::_1, lambda::_2),
+              taskId,
+              None(),
+              vector<string>());
+
+        if (_checker.isError()) {
+          // TODO(anand): Should we send a TASK_FAILED instead?
+          LOG(ERROR) << "Failed to create checker: " << _checker.error();
+          __shutdown();
+          return;
+        }
+
+        checkers[taskId] = _checker.get();
+      }
+
       if (task.has_health_check()) {
         // TODO(anand): Add support for command health checks.
         CHECK_NE(HealthCheck::COMMAND, task.health_check().type())
@@ -618,6 +642,14 @@ protected:
       deserialize<agent::Response>(contentType, response->body);
     CHECK_SOME(waitResponse);
 
+    // If there is an associated checker with the task, stop it to
+    // avoid sending check updates after a terminal status update.
+    if (checkers.contains(taskId)) {
+      CHECK_NOTNULL(checkers.at(taskId).get());
+      checkers.at(taskId)->stop();
+      checkers.erase(taskId);
+    }
+
     // If the task is health checked, stop the associated health checker
     // to avoid sending health updates after a terminal status update.
     if (healthCheckers.contains(taskId)) {
@@ -696,6 +728,12 @@ protected:
     LOG(INFO) << "Shutting down";
 
     shuttingDown = true;
+
+    // Stop running checks for all tasks because we are shutting down.
+    foreach (const Owned<checks::Checker>& checker, checkers.values()) {
+      checker->stop();
+    }
+    checkers.clear();
 
     // Stop health checking all tasks because we are shutting down.
     foreach (const Owned<checks::HealthChecker>& healthChecker,
@@ -860,6 +898,29 @@ protected:
     }
   }
 
+  void taskCheckUpdated(
+      const TaskID& taskId,
+      const CheckStatusInfo& checkStatus)
+  {
+    // This prevents us from sending check updates after a terminal
+    // status update, because we may receive an update from a check
+    // scheduled before the task has been waited on.
+    //
+    // TODO(alexr): Once we support `TASK_KILLING` in this executor,
+    // consider sending check updates after `TASK_KILLING`.
+    if (!checkers.contains(taskId)) {
+      return;
+    }
+
+    LOG(INFO) << "Received check update for task '" << taskId << "'";
+
+    bootstrappedUpdate(
+        taskId,
+        TaskStatus::REASON_TASK_CHECK_STATUS_UPDATED,
+        None(),
+        checkStatus);
+  }
+
 private:
   // NOTE: Health updates should in general use `bootstrappedUpdate()`.
   // However, if the task is terminated due to a health check, we send
@@ -914,7 +975,8 @@ private:
   void bootstrappedUpdate(
       const TaskID& taskId,
       const Option<TaskStatus::Reason>& reason = None(),
-      const Option<bool>& healthy = None())
+      const Option<bool>& healthy = None(),
+      const Option<CheckStatusInfo>& checkStatus = None())
   {
     CHECK(lastTaskStatuses.contains(taskId));
     TaskStatus lastTaskStatus = lastTaskStatuses[taskId];
@@ -932,6 +994,10 @@ private:
 
     if (healthy.isSome()) {
       status.set_healthy(healthy.get());
+    }
+
+    if (checkStatus.isSome()) {
+      status.mutable_check_status()->CopyFrom(checkStatus.get());
     }
 
     sendTaskStatusUpdate(status);
@@ -1085,6 +1151,7 @@ private:
   // a `connected()` callback.
   Option<UUID> connectionId;
 
+  hashmap<TaskID, Owned<checks::Checker>> checkers;
   hashmap<TaskID, Owned<checks::HealthChecker>> healthCheckers;
 };
 
