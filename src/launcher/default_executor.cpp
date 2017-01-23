@@ -170,8 +170,13 @@ public:
       }
 
       case Event::ACKNOWLEDGED: {
+        if (!updates.contains(event.acknowledged().uuid())) {
+          LOG(WARNING) << "Received acknowledgement for unknown status update";
+          return;
+        }
+
         // Remove the corresponding update.
-        updates.erase(UUID::fromBytes(event.acknowledged().uuid()).get());
+        updates.erase(event.acknowledged().uuid());
 
         // Remove the corresponding task.
         tasks.erase(event.acknowledged().task_id());
@@ -901,7 +906,7 @@ private:
     call.mutable_update()->mutable_status()->CopyFrom(status);
 
     // Capture the status update.
-    updates[uuid] = call.update();
+    updates[status.uuid()] = call.update();
 
     mesos->send(evolve(call));
   }
@@ -1013,7 +1018,7 @@ private:
   const ::URL agent; // Agent API URL.
   const string sandboxDirectory;
   const string launcherDirectory;
-  LinkedHashMap<UUID, Call::Update> updates; // Unacknowledged updates.
+  LinkedHashMap<string, Call::Update> updates; // Unacknowledged updates.
   LinkedHashMap<TaskID, TaskInfo> tasks; // Unacknowledged tasks.
 
   // TODO(anand): Consider creating a `Container` struct to manage
