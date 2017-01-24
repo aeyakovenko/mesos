@@ -29,6 +29,8 @@
 
 #include <mesos/mesos.hpp>
 
+#include <mesos/agent/agent.hpp>
+
 #include <process/collect.hpp>
 #include <process/delay.hpp>
 #include <process/dispatch.hpp>
@@ -49,8 +51,11 @@
 
 #include <stout/os/killtree.hpp>
 
+#include "common/http.hpp"
 #include "common/status_utils.hpp"
 #include "common/validation.hpp"
+
+#include "internal/evolve.hpp"
 
 #ifdef __linux__
 #include "linux/ns.hpp"
@@ -64,6 +69,9 @@ using process::Future;
 using process::Owned;
 using process::Subprocess;
 using process::Time;
+
+using process::http::Connection;
+using process::http::Response;
 
 using std::map;
 using std::string;
@@ -119,6 +127,39 @@ static pid_t cloneWithSetns(
 #endif
 
 
+inline process::http::Request createRequest(
+    const process::http::URL& url,
+    const agent::Call& call)
+{
+  process::http::Request request;
+  request.method = "POST";
+  request.url = url;
+  request.body = serialize(ContentType::PROTOBUF, evolve(call));
+  request.keepAlive = false;
+  request.headers = {{"Accept", stringify(ContentType::PROTOBUF)},
+                     {"Content-Type", stringify(ContentType::PROTOBUF)}};
+
+  return request;
+}
+
+
+inline Future<Response> post(
+    const process::http::URL& url,
+    const agent::Call& call)
+{
+  return process::http::request(createRequest(url, call), false);
+}
+
+
+Future<Response> post(
+    Connection& connection,
+    const process::http::URL& url,
+    const agent::Call& call)
+{
+  return connection.send(createRequest(url, call), false);
+}
+
+
 Try<Owned<HealthChecker>> HealthChecker::create(
     const HealthCheck& check,
     const string& launcherDir,
@@ -139,7 +180,42 @@ Try<Owned<HealthChecker>> HealthChecker::create(
       callback,
       taskId,
       taskPid,
-      namespaces));
+      namespaces,
+      None(),
+      None(),
+      None(),
+      false));
+
+  return Owned<HealthChecker>(new HealthChecker(process));
+}
+
+
+Try<Owned<HealthChecker>> HealthChecker::create(
+    const HealthCheck& check,
+    const string& launcherDir,
+    const lambda::function<void(const TaskHealthStatus&)>& callback,
+    const TaskID& taskId,
+    const ContainerID& taskContainerId,
+    const process::http::URL& agentURL,
+    const Option<Environment>& taskEnv)
+{
+  // Validate the 'HealthCheck' protobuf.
+  Option<Error> error = validation::healthCheck(check);
+  if (error.isSome()) {
+    return error.get();
+  }
+
+  Owned<HealthCheckerProcess> process(new HealthCheckerProcess(
+      check,
+      launcherDir,
+      callback,
+      taskId,
+      None(),
+      vector<string>(),
+      taskContainerId,
+      agentURL,
+      taskEnv,
+      true));
 
   return Owned<HealthChecker>(new HealthChecker(process));
 }
@@ -173,8 +249,12 @@ HealthCheckerProcess::HealthCheckerProcess(
     const string& _launcherDir,
     const lambda::function<void(const TaskHealthStatus&)>& _callback,
     const TaskID& _taskId,
-    Option<pid_t> _taskPid,
-    const vector<string>& _namespaces)
+    const Option<pid_t>& _taskPid,
+    const vector<string>& _namespaces,
+    const Option<ContainerID>& _taskContainerId,
+    const Option<process::http::URL>& _agentURL,
+    const Option<Environment>& _taskEnv,
+    bool _agentSpawnsCommandContainer)
   : ProcessBase(process::ID::generate("health-checker")),
     check(_check),
     launcherDir(_launcherDir),
@@ -182,6 +262,10 @@ HealthCheckerProcess::HealthCheckerProcess(
     taskId(_taskId),
     taskPid(_taskPid),
     namespaces(_namespaces),
+    taskContainerId(_taskContainerId),
+    agentURL(_agentURL),
+    taskEnv(_taskEnv),
+    agentSpawnsCommandContainer(_agentSpawnsCommandContainer),
     consecutiveFailures(0),
     initializing(true)
 {
@@ -284,7 +368,12 @@ void HealthCheckerProcess::performSingleCheck()
 
   switch (check.type()) {
     case HealthCheck::COMMAND: {
-      checkResult = commandHealthCheck();
+      if (agentSpawnsCommandContainer) {
+        checkResult = nestedCommandHealthCheck();
+      } else {
+        checkResult = commandHealthCheck();
+      }
+
       break;
     }
 
@@ -326,6 +415,155 @@ void HealthCheckerProcess::processCheckResult(
                    (future.isFailed() ? future.failure() : "discarded");
 
   failure(message);
+}
+
+
+Future<Nothing> HealthCheckerProcess::nestedCommandHealthCheck()
+{
+  CHECK_EQ(HealthCheck::COMMAND, check.type());
+  CHECK(taskContainerId.isSome());
+  CHECK(check.has_command());
+  CHECK(agentURL.isSome());
+
+  return process::http::connect(agentURL.get())
+    .repair([](const Future<Connection>& future) {
+      return Failure(
+          "Unable to establish connection with the agent: " + future.failure());
+    })
+    .then(defer(self(), &Self::_nestedCommandHealthCheck, lambda::_1));
+}
+
+
+Future<Nothing> HealthCheckerProcess::_nestedCommandHealthCheck(
+    Connection connection)
+{
+  ContainerID checkContainerId;
+  checkContainerId.set_value(taskContainerId.get().value() + "-health-check");
+  checkContainerId.mutable_parent()->CopyFrom(taskContainerId.get());
+
+  CommandInfo command(check.command());
+
+  if (taskEnv.isSome()) {
+    // Merge the task and the check environments. The environment of
+    // the health check takes precedence over the one of the task.
+    //
+    // TODO(gkleiman): This only merges the Task env as described by the
+    // framework, but the actual env might be different. A better approach
+    // would be to make the agent copy the env of the parent container.
+
+    map<string, string> env;
+
+    foreach (const Environment::Variable& variable, taskEnv->variables()) {
+      env[variable.name()] = variable.value();
+    }
+
+    foreach (const Environment::Variable& variable,
+        check.command().environment().variables()) {
+      env[variable.name()] = variable.value();
+    }
+
+    command.clear_environment();
+    foreachpair (const string& name, const string& value, env) {
+      Environment::Variable* variable =
+        command.mutable_environment()->mutable_variables()->Add();
+      variable->set_name(name);
+      variable->set_value(value);
+    }
+  }
+
+  agent::Call call;
+  call.set_type(agent::Call::LAUNCH_NESTED_CONTAINER_SESSION);
+
+  agent::Call::LaunchNestedContainerSession* launch =
+    call.mutable_launch_nested_container_session();
+
+  launch->mutable_container_id()->CopyFrom(checkContainerId);
+  launch->mutable_command()->CopyFrom(command);
+
+  return post(connection, agentURL.get(), call)
+    .after(checkTimeout,
+           defer(self(),
+                 &Self::nestedCommandHealthCheckTimedOut,
+                 checkContainerId,
+                 connection,
+                 lambda::_1))
+    .then(defer(self(),
+          &Self::__nestedCommandHealthCheck,
+          checkContainerId,
+          lambda::_1));
+}
+
+
+Future<Nothing> HealthCheckerProcess::__nestedCommandHealthCheck(
+    const ContainerID& checkContainerId,
+    const Response& launchResponse)
+{
+  if (launchResponse.code != process::http::Status::OK) {
+    return Failure(
+        "Received '" + launchResponse.status + "' (" + launchResponse.body +
+        ") while launching command health check in a child container");
+  }
+
+  return waitForNestedContainer(checkContainerId)
+    .then([](const Option<int> status) -> Future<Nothing> {
+      if (status.isNone() || status.get() != 0) {
+        return Failure("Command returned " + stringify(status.get()));
+      } else {
+        return Nothing();
+      }
+    });
+}
+
+
+Future<Response>
+HealthCheckerProcess::nestedCommandHealthCheckTimedOut(
+    const ContainerID& checkContainerId,
+    Connection connection,
+    Future<Response> future)
+{
+  future.discard();
+
+  // Closing the connection will make the agent kill the container.
+  connection.disconnect();
+
+  const Failure failure =
+    Failure("Command has not returned after " + stringify(checkTimeout));
+
+  return waitForNestedContainer(checkContainerId)
+    .repair([failure](const Future<Option<int>>& future) {
+        return failure;
+    })
+    .then([failure](const Option<int>& status) -> Future<Response> {
+        return failure;
+    });
+}
+
+
+Future<Option<int>> HealthCheckerProcess::waitForNestedContainer(
+    const ContainerID& containerId)
+{
+  agent::Call call;
+  call.set_type(agent::Call::WAIT_NESTED_CONTAINER);
+
+  agent::Call::WaitNestedContainer* containerWait =
+    call.mutable_wait_nested_container();
+
+  containerWait->mutable_container_id()->CopyFrom(containerId);
+
+  return post(agentURL.get(), call)
+    .then([this](const Response& httpResponse) -> Future<Option<int>> {
+      if (httpResponse.code != process::http::Status::OK) {
+        return Failure(
+            "Received '" + httpResponse.status + "' (" + httpResponse.body +
+            ") waiting on health check of task '" + stringify(taskId) + "'");
+      }
+
+      Try<agent::Response> response =
+        deserialize<agent::Response>(ContentType::PROTOBUF, httpResponse.body);
+      CHECK_SOME(response);
+
+      return response->wait_nested_container().exit_status();
+    });
 }
 
 
@@ -482,7 +720,7 @@ Future<Nothing> HealthCheckerProcess::httpHealthCheck()
       }
 
       return Failure(
-          string(HTTP_CHECK_COMMAND) + " has not returned after " +
+          string(HTTP_CHECK_COMMAND) + " timed out after " +
           stringify(timeout) + "; aborting");
     })
     .then(defer(self(), &Self::_httpHealthCheck, lambda::_1));
@@ -608,7 +846,7 @@ Future<Nothing> HealthCheckerProcess::tcpHealthCheck()
       }
 
       return Failure(
-          string(TCP_CHECK_COMMAND) + " has not returned after " +
+          string(TCP_CHECK_COMMAND) + " timed out after " +
           stringify(timeout) + "; aborting");
     })
     .then(defer(self(), &Self::_tcpHealthCheck, lambda::_1));
