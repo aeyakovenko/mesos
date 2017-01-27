@@ -204,18 +204,21 @@ public:
       }
 
       case Event::ACKNOWLEDGED: {
-        const UUID uuid = UUID::fromBytes(event.acknowledged().uuid()).get();
+        if (!updates.contains(event.acknowledged().uuid())) {
+          LOG(WARNING) << "Received acknowledgement for unknown status update";
+          return;
+        }
 
         // Terminate if we receive the ACK for the terminal status update.
         // NOTE: The executor receives an ACK iff it uses the HTTP library.
         // No ACK will be received if V0ToV1Adapter is used.
         if (mesos::internal::protobuf::isTerminalState(
-            updates[uuid].status().state())) {
+            updates[event.acknowledged().uuid()].status().state())) {
           terminate(self());
         }
 
         // Remove the corresponding update.
-        updates.erase(uuid);
+        updates.erase(event.acknowledged().uuid());
 
         // Remove the corresponding task.
         task = None();
@@ -738,7 +741,7 @@ private:
     call.mutable_update()->mutable_status()->CopyFrom(status);
 
     // Capture the status update.
-    updates[uuid] = call.update();
+    updates[status.uuid()] = call.update();
 
     mesos->send(evolve(call));
   }
@@ -795,7 +798,7 @@ private:
   const FrameworkID frameworkId;
   const ExecutorID executorId;
   Owned<MesosBase> mesos;
-  LinkedHashMap<UUID, Call::Update> updates; // Unacknowledged updates.
+  LinkedHashMap<string, Call::Update> updates; // Unacknowledged updates.
   Option<TaskInfo> task; // Unacknowledged task.
   Owned<checks::HealthChecker> checker;
 };
