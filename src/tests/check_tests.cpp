@@ -769,6 +769,19 @@ TEST_F(CheckTest, CommandExecutorHTTPCheckDelivered)
 }
 
 
+// TODO(alexr): Implement following tests for the docker executor once
+// the docker executor supports checks.
+//
+// 1. COMMAND check with env var works, is delivered, and is reconciled
+//    properly.
+// 2. COMMAND check's status change is delivered. TODO(alexr): When check
+//    mocking is available, ensure only status changes are delivered.
+// 3. COMMAND check times out.
+// 4. COMMAND check and health check do not shadow each other; upon
+//    reconciliation both statuses are available.
+// 5. HTTP check works and is delivered.
+
+
 // These are check tests with the default executor.
 //
 // TODO(alexr): Implement following tests once the default executor supports
