@@ -14,18 +14,765 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <mesos/mesos.hpp>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <mesos/v1/mesos.hpp>
+
+#include <process/clock.hpp>
+#include <process/owned.hpp>
+
+#include <stout/foreach.hpp>
+#include <stout/nothing.hpp>
+#include <stout/path.hpp>
+#include <stout/try.hpp>
+
+#include <stout/os/getcwd.hpp>
 
 #include "checks/checker.hpp"
 
+#include "tests/flags.hpp"
+#include "tests/health_check_test_helper.hpp"
 #include "tests/mesos.hpp"
+#include "tests/utils.hpp"
+
+using mesos::master::detector::MasterDetector;
+
+using mesos::v1::scheduler::Call;
+using mesos::v1::scheduler::Event;
+using mesos::v1::scheduler::Mesos;
+
+using process::Future;
+using process::Owned;
+
+using std::pair;
+using std::string;
+using std::vector;
 
 namespace mesos {
 namespace internal {
 namespace tests {
 
-class CheckTest : public MesosTest {};
+// Tests for checks support in built in executors. Logically the tests
+// are elements of the cartesian product `executor-type` x `check-type`
+// and are split into groups by `executor-type`:
+//   * command executor tests,
+//   * docker executor tests,
+//   * default executor tests.
 
+class CheckTest : public MesosTest
+{
+public:
+  virtual void callAcknowledge(
+      Mesos* mesos,
+      const v1::FrameworkID& frameworkId,
+      const v1::TaskStatus& status)
+  {
+    Call call;
+    call.mutable_framework_id()->CopyFrom(frameworkId);
+    call.set_type(Call::ACKNOWLEDGE);
+
+    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
+    acknowledge->mutable_task_id()->CopyFrom(status.task_id());
+    acknowledge->mutable_agent_id()->CopyFrom(status.agent_id());
+    acknowledge->set_uuid(status.uuid());
+
+    mesos->send(call);
+  }
+
+  virtual void callLaunchTask(
+      Mesos* mesos,
+      const v1::Offer& offer,
+      const v1::TaskInfo& task)
+  {
+    Call call;
+    call.mutable_framework_id()->CopyFrom(offer.framework_id());
+    call.set_type(Call::ACCEPT);
+
+    Call::Accept* accept = call.mutable_accept();
+    accept->add_offer_ids()->CopyFrom(offer.id());
+
+    v1::Offer::Operation* operation = accept->add_operations();
+    operation->set_type(v1::Offer::Operation::LAUNCH);
+    operation->mutable_launch()->add_task_infos()->CopyFrom(task);
+
+    mesos->send(call);
+  }
+
+  virtual void callLaunchTaskGroup(
+      Mesos* mesos,
+      const v1::Offer& offer,
+      const v1::ExecutorInfo& executor,
+      const v1::TaskGroupInfo& taskGroup)
+  {
+    Call call;
+    call.mutable_framework_id()->CopyFrom(offer.framework_id());
+    call.set_type(Call::ACCEPT);
+
+    Call::Accept* accept = call.mutable_accept();
+    accept->add_offer_ids()->CopyFrom(offer.id());
+
+    v1::Offer::Operation* operation = accept->add_operations();
+    operation->set_type(v1::Offer::Operation::LAUNCH_GROUP);
+
+    v1::Offer::Operation::LaunchGroup* launchGroup =
+      operation->mutable_launch_group();
+
+    launchGroup->mutable_executor()->CopyFrom(executor);
+    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+    mesos->send(call);
+  }
+
+  virtual void callReconcile(
+      Mesos* mesos,
+      const v1::FrameworkID& frameworkId,
+      const vector<pair<const v1::TaskID, const v1::AgentID>>& tasks)
+  {
+    Call call;
+    call.mutable_framework_id()->CopyFrom(frameworkId);
+    call.set_type(Call::RECONCILE);
+
+    call.mutable_reconcile();
+
+    foreach (const auto& task, tasks) {
+      Call::Reconcile::Task* reconciledTask =
+        call.mutable_reconcile()->add_tasks();
+      reconciledTask->mutable_task_id()->CopyFrom(task.first);
+      reconciledTask->mutable_agent_id()->CopyFrom(task.second);
+    }
+
+    mesos->send(call);
+  }
+
+  virtual void callSubscribe(
+      Mesos* mesos,
+      const v1::FrameworkInfo& framework)
+  {
+    Call call;
+    call.set_type(Call::SUBSCRIBE);
+    Call::Subscribe* subscribe = call.mutable_subscribe();
+    subscribe->mutable_framework_info()->CopyFrom(framework);
+
+    mesos->send(call);
+  }
+};
+
+
+// These are check tests with the command executor.
+
+// Verifies that a command check is supported by the command executor,
+// its status is delivered in a task status update, and the last known
+// status can be obtained during explicit and implicit reconciliation.
+// Additionally ensures that the specified environment of the command
+// check is honored.
+//
+// TODO(alexr): Verify that an empty check status is included in every
+// non-terminal status update when no check result is available (yet).
+TEST_F(CheckTest, CommandExecutorCommandCheckDeliveredAndReconciled)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get());
+  ASSERT_SOME(agent);
+
+  v1::FrameworkInfo frameworkInfo = evolve(DEFAULT_FRAMEWORK_INFO);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(connected);
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  callSubscribe(&mesos, frameworkInfo);
+
+  AWAIT_READY(subscribed);
+
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0, offers->offers().size());
+  const v1::Offer& offer = offers->offers(0);
+
+  Future<Event::Update> updateTaskRunning;
+  Future<Event::Update> updateCheckResult;
+  Future<Event::Update> updateExplicitReconciliation;
+  Future<Event::Update> updateImplicitReconciliation;
+
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&updateTaskRunning))
+    .WillOnce(FutureArg<1>(&updateCheckResult))
+    .WillOnce(FutureArg<1>(&updateExplicitReconciliation))
+    .WillOnce(FutureArg<1>(&updateImplicitReconciliation))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
+
+  v1::TaskInfo taskInfo = evolve(
+      createTask(devolve(offer), SLEEP_COMMAND(10000)));
+
+  v1::CheckInfo* checkInfo = taskInfo.mutable_check();
+  checkInfo->set_type(v1::CheckInfo::COMMAND);
+  checkInfo->set_delay_seconds(0);
+  checkInfo->set_interval_seconds(0);
+
+  v1::CommandInfo* checkCommand =
+    checkInfo->mutable_command()->mutable_command();
+  checkCommand->set_value("exit $STATUS");
+
+  v1::Environment::Variable* exitStatusVar =
+    checkCommand->mutable_environment()->add_variables();
+  exitStatusVar->set_name("STATUS");
+  exitStatusVar->set_value("1");
+
+  callLaunchTask(&mesos, offer, taskInfo);
+
+  AWAIT_READY(updateTaskRunning);
+  ASSERT_EQ(TASK_RUNNING, updateTaskRunning->status().state());
+  EXPECT_EQ(taskInfo.task_id(), updateTaskRunning->status().task_id());
+
+  callAcknowledge(&mesos, frameworkId, updateTaskRunning->status());
+
+  AWAIT_READY(updateCheckResult);
+  const auto& checkResult = updateCheckResult->status();
+
+  ASSERT_EQ(TASK_RUNNING, checkResult.state());
+  EXPECT_EQ(taskInfo.task_id(), checkResult.task_id());
+  EXPECT_TRUE(checkResult.has_check_status());
+  EXPECT_TRUE(checkResult.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      1,
+      checkResult.check_status().command().exit_code());
+
+  callAcknowledge(&mesos, frameworkId, checkResult);
+
+  // Trigger explicit reconciliation.
+  callReconcile(
+      &mesos,
+      frameworkId,
+      {std::make_pair(checkResult.task_id(), checkResult.agent_id())});
+
+  AWAIT_READY(updateExplicitReconciliation);
+
+  const auto& explicitReconciliation = updateExplicitReconciliation->status();
+  ASSERT_EQ(TASK_RUNNING, explicitReconciliation.state());
+  ASSERT_EQ(TaskStatus::REASON_RECONCILIATION, explicitReconciliation.reason());
+  EXPECT_EQ(taskInfo.task_id(), explicitReconciliation.task_id());
+  EXPECT_TRUE(explicitReconciliation.has_check_status());
+  EXPECT_TRUE(explicitReconciliation.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      1,
+      explicitReconciliation.check_status().command().exit_code());
+
+  callAcknowledge(&mesos, frameworkId, explicitReconciliation);
+
+  // Trigger implicit reconciliation.
+  callReconcile(&mesos, frameworkId, {});
+
+  AWAIT_READY(updateImplicitReconciliation);
+
+  const auto& implicitReconciliation = updateImplicitReconciliation->status();
+  ASSERT_EQ(TASK_RUNNING, implicitReconciliation.state());
+  ASSERT_EQ(TaskStatus::REASON_RECONCILIATION, implicitReconciliation.reason());
+  EXPECT_EQ(taskInfo.task_id(), implicitReconciliation.task_id());
+  EXPECT_TRUE(implicitReconciliation.has_check_status());
+  EXPECT_TRUE(implicitReconciliation.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      1,
+      implicitReconciliation.check_status().command().exit_code());
+}
+
+
+// Verifies that a command check's status changes are delivered.
+//
+// TODO(alexr): When check mocking is available, ensure that *only*
+// status changes are delivered.
+TEST_F(CheckTest, CommandExecutorCommandCheckStatusChange)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get());
+  ASSERT_SOME(agent);
+
+  v1::FrameworkInfo frameworkInfo = evolve(DEFAULT_FRAMEWORK_INFO);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(connected);
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  callSubscribe(&mesos, frameworkInfo);
+
+  AWAIT_READY(subscribed);
+
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0, offers->offers().size());
+  const v1::Offer& offer = offers->offers(0);
+
+  Future<Event::Update> updateTaskRunning;
+  Future<Event::Update> updateCheckResult;
+  Future<Event::Update> updateCheckResultChanged;
+  Future<Event::Update> updateCheckResultBack;
+
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&updateTaskRunning))
+    .WillOnce(FutureArg<1>(&updateCheckResult))
+    .WillOnce(FutureArg<1>(&updateCheckResultChanged))
+    .WillOnce(FutureArg<1>(&updateCheckResultBack))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
+
+  v1::TaskInfo taskInfo = evolve(
+      createTask(devolve(offer), SLEEP_COMMAND(10000)));
+
+  v1::CheckInfo* checkInfo = taskInfo.mutable_check();
+  checkInfo->set_type(v1::CheckInfo::COMMAND);
+  checkInfo->set_delay_seconds(0);
+  checkInfo->set_interval_seconds(0);
+
+  // This command fails every other invocation.
+  // For all runs i in Nat0, the following case i % 2 applies:
+  //
+  // Case 0:
+  //   - Attempt to remove the nonexistent temporary file.
+  //   - Create the temporary file.
+  //   - Exit with a non-zero status.
+  //
+  // Case 1:
+  //   - Remove the temporary file.
+  //   - Exit with a zero status.
+  const string tmpPath = path::join(os::getcwd(), "XXXXXX");
+  const string checkCommandString =
+    "rm " + tmpPath + " || (touch " + tmpPath + "; exit 1)";
+
+  checkInfo->mutable_command()->mutable_command()->set_value(
+      checkCommandString);
+
+  callLaunchTask(&mesos, offer, taskInfo);
+
+  AWAIT_READY(updateTaskRunning);
+  ASSERT_EQ(TASK_RUNNING, updateTaskRunning->status().state());
+  EXPECT_EQ(taskInfo.task_id(), updateTaskRunning->status().task_id());
+
+  callAcknowledge(&mesos, frameworkId, updateTaskRunning->status());
+
+  AWAIT_READY(updateCheckResult);
+  const auto& checkResult = updateCheckResult->status();
+
+  ASSERT_EQ(TASK_RUNNING, checkResult.state());
+  EXPECT_TRUE(checkResult.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      1,
+      checkResult.check_status().command().exit_code());
+
+  callAcknowledge(&mesos, frameworkId, checkResult);
+
+  AWAIT_READY(updateCheckResultChanged);
+  const auto& checkResultChanged = updateCheckResultChanged->status();
+
+  ASSERT_EQ(TASK_RUNNING, checkResultChanged.state());
+  EXPECT_TRUE(checkResultChanged.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      0,
+      checkResultChanged.check_status().command().exit_code());
+
+  callAcknowledge(&mesos, frameworkId, checkResultChanged);
+
+  AWAIT_READY(updateCheckResultBack);
+  const auto& checkResultBack = updateCheckResultBack->status();
+
+  ASSERT_EQ(TASK_RUNNING, checkResultBack.state());
+  EXPECT_TRUE(checkResultBack.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      1,
+      checkResultBack.check_status().command().exit_code());
+}
+
+
+// Verifies that when a command check times out after a successful check,
+// an empty check status update is delivered.
+TEST_F(CheckTest, CommandExecutorCommandCheckTimeout)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get());
+  ASSERT_SOME(agent);
+
+  v1::FrameworkInfo frameworkInfo = evolve(DEFAULT_FRAMEWORK_INFO);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(connected);
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  callSubscribe(&mesos, frameworkInfo);
+
+  AWAIT_READY(subscribed);
+
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0, offers->offers().size());
+  const v1::Offer& offer = offers->offers(0);
+
+  Future<Event::Update> updateTaskRunning;
+  Future<Event::Update> updateCheckResult;
+  Future<Event::Update> updateCheckResultTimeout;
+
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&updateTaskRunning))
+    .WillOnce(FutureArg<1>(&updateCheckResult))
+    .WillOnce(FutureArg<1>(&updateCheckResultTimeout))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
+
+  v1::TaskInfo taskInfo = evolve(
+      createTask(devolve(offer), SLEEP_COMMAND(10000)));
+
+  v1::CheckInfo* checkInfo = taskInfo.mutable_check();
+  checkInfo->set_type(v1::CheckInfo::COMMAND);
+  checkInfo->set_delay_seconds(0);
+  checkInfo->set_interval_seconds(0);
+  checkInfo->set_timeout_seconds(1);
+
+  // This command fails every other invocation.
+  // For all runs i in Nat0, the following case i % 2 applies:
+  //
+  // Case 0:
+  //   - Attempt to remove the nonexistent temporary file.
+  //   - Create the temporary file.
+  //   - Exit with a non-zero status.
+  //
+  // Case 1:
+  //   - Remove the temporary file.
+  //   - Exit with a zero status.
+  const string tmpPath = path::join(os::getcwd(), "XXXXXX");
+  const string checkCommandString =
+    "(cat " + tmpPath + " && sleep 1000) || (touch " + tmpPath + "; exit 1)";
+
+  checkInfo->mutable_command()->mutable_command()->set_value(
+      checkCommandString);
+
+  callLaunchTask(&mesos, offer, taskInfo);
+
+  AWAIT_READY(updateTaskRunning);
+  ASSERT_EQ(TASK_RUNNING, updateTaskRunning->status().state());
+  EXPECT_EQ(taskInfo.task_id(), updateTaskRunning->status().task_id());
+
+  callAcknowledge(&mesos, frameworkId, updateTaskRunning->status());
+
+  AWAIT_READY(updateCheckResult);
+  const auto& checkResult = updateCheckResult->status();
+
+  ASSERT_EQ(TASK_RUNNING, checkResult.state());
+  EXPECT_TRUE(checkResult.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      1,
+      checkResult.check_status().command().exit_code());
+
+  callAcknowledge(&mesos, frameworkId, checkResult);
+
+  AWAIT_READY(updateCheckResultTimeout);
+  const auto& checkResultTimeout = updateCheckResultTimeout->status();
+
+  ASSERT_EQ(TASK_RUNNING, checkResultTimeout.state());
+  EXPECT_FALSE(checkResultTimeout.check_status().command().has_exit_code());
+}
+
+
+// Verifies that when both command check and health check are specified,
+// health and check updates include both statuses. Also verifies that
+// both statuses are included upon reconciliation.
+TEST_F(CheckTest, CommandExecutorCommandCheckAndHealthCheckNoShadowing)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get());
+  ASSERT_SOME(agent);
+
+  v1::FrameworkInfo frameworkInfo = evolve(DEFAULT_FRAMEWORK_INFO);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(connected);
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  callSubscribe(&mesos, frameworkInfo);
+
+  AWAIT_READY(subscribed);
+
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0, offers->offers().size());
+  const v1::Offer& offer = offers->offers(0);
+
+  Future<Event::Update> updateTaskRunning;
+  Future<Event::Update> updateCheckResult;
+  Future<Event::Update> updateHealthResult;
+  Future<Event::Update> updateImplicitReconciliation;
+
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&updateTaskRunning))
+    .WillOnce(FutureArg<1>(&updateCheckResult))
+    .WillOnce(FutureArg<1>(&updateHealthResult))
+    .WillOnce(FutureArg<1>(&updateImplicitReconciliation))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
+
+  v1::TaskInfo taskInfo = evolve(
+      createTask(devolve(offer), SLEEP_COMMAND(10000)));
+
+  v1::CheckInfo* checkInfo = taskInfo.mutable_check();
+  checkInfo->set_type(v1::CheckInfo::COMMAND);
+  checkInfo->set_delay_seconds(0);
+  checkInfo->set_interval_seconds(0);
+  checkInfo->mutable_command()->mutable_command()->set_value("exit 1");
+
+  // Delay health check for 1s to ensure health update comes after check update.
+  v1::HealthCheck* healthCheckInfo = taskInfo.mutable_health_check();
+  healthCheckInfo->set_type(v1::HealthCheck::COMMAND);
+  healthCheckInfo->set_delay_seconds(1);
+  healthCheckInfo->set_interval_seconds(0);
+  healthCheckInfo->mutable_command()->set_value("exit 0");
+
+  callLaunchTask(&mesos, offer, taskInfo);
+
+  AWAIT_READY(updateTaskRunning);
+  ASSERT_EQ(TASK_RUNNING, updateTaskRunning->status().state());
+  EXPECT_EQ(taskInfo.task_id(), updateTaskRunning->status().task_id());
+
+  callAcknowledge(&mesos, frameworkId, updateTaskRunning->status());
+
+  AWAIT_READY(updateCheckResult);
+  const auto& checkResult = updateCheckResult->status();
+
+  ASSERT_EQ(TASK_RUNNING, checkResult.state());
+  EXPECT_EQ(taskInfo.task_id(), checkResult.task_id());
+  EXPECT_FALSE(checkResult.has_healthy());
+  EXPECT_TRUE(checkResult.has_check_status());
+  EXPECT_TRUE(checkResult.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      1,
+      checkResult.check_status().command().exit_code());
+
+  callAcknowledge(&mesos, frameworkId, checkResult);
+
+  AWAIT_READY(updateHealthResult);
+  const auto& healthResult = updateHealthResult->status();
+
+  ASSERT_EQ(TASK_RUNNING, healthResult.state());
+  EXPECT_EQ(taskInfo.task_id(), healthResult.task_id());
+  EXPECT_TRUE(healthResult.has_healthy());
+  EXPECT_TRUE(healthResult.healthy());
+  EXPECT_TRUE(healthResult.has_check_status());
+  EXPECT_TRUE(healthResult.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      1,
+      healthResult.check_status().command().exit_code());
+
+  callAcknowledge(&mesos, frameworkId, healthResult);
+
+  // Trigger implicit reconciliation.
+  callReconcile(&mesos, frameworkId, {});
+
+  AWAIT_READY(updateImplicitReconciliation);
+
+  const auto& implicitReconciliation = updateImplicitReconciliation->status();
+  ASSERT_EQ(TASK_RUNNING, implicitReconciliation.state());
+  ASSERT_EQ(TaskStatus::REASON_RECONCILIATION, implicitReconciliation.reason());
+  EXPECT_EQ(taskInfo.task_id(), implicitReconciliation.task_id());
+  EXPECT_TRUE(implicitReconciliation.has_check_status());
+  EXPECT_TRUE(implicitReconciliation.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      1,
+      implicitReconciliation.check_status().command().exit_code());
+}
+
+
+// Verifies that an http check is supported by the command executor and
+// its status is delivered in a task status update.
+TEST_F(CheckTest, CommandExecutorHTTPCheckDelivered)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get());
+  ASSERT_SOME(agent);
+
+  v1::FrameworkInfo frameworkInfo = evolve(DEFAULT_FRAMEWORK_INFO);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(connected);
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  callSubscribe(&mesos, frameworkInfo);
+
+  AWAIT_READY(subscribed);
+
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0, offers->offers().size());
+  const v1::Offer& offer = offers->offers(0);
+
+  Future<v1::scheduler::Event::Update> updateTaskRunning;
+  Future<v1::scheduler::Event::Update> updateCheckResult;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&updateTaskRunning))
+    .WillOnce(FutureArg<1>(&updateCheckResult))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
+
+  const uint16_t testPort = getFreePort().get();
+
+  // Use `test-helper` to launch a simple HTTP
+  // server to respond to HTTP checks.
+  const string command = strings::format(
+      "%s %s --ip=127.0.0.1 --port=%u",
+      getTestHelperPath("test-helper"),
+      HealthCheckTestHelper::NAME,
+      testPort).get();
+
+  v1::TaskInfo taskInfo = evolve(createTask(devolve(offer), command));
+
+  v1::CheckInfo* checkInfo = taskInfo.mutable_check();
+  checkInfo->set_type(v1::CheckInfo::HTTP);
+  checkInfo->mutable_http()->set_port(testPort);
+  checkInfo->mutable_http()->set_path("/help");
+  checkInfo->set_delay_seconds(0);
+  checkInfo->set_interval_seconds(0);
+
+  callLaunchTask(&mesos, offer, taskInfo);
+
+  AWAIT_READY(updateTaskRunning);
+  ASSERT_EQ(TASK_RUNNING, updateTaskRunning->status().state());
+  EXPECT_EQ(taskInfo.task_id(), updateTaskRunning->status().task_id());
+
+  callAcknowledge(&mesos, frameworkId, updateTaskRunning->status());
+
+  AWAIT_READY(updateCheckResult);
+  const auto& checkResult = updateCheckResult->status();
+
+  ASSERT_EQ(TASK_RUNNING, checkResult.state());
+  EXPECT_EQ(taskInfo.task_id(), checkResult.task_id());
+  EXPECT_TRUE(checkResult.has_check_status());
+  EXPECT_TRUE(checkResult.check_status().http().has_status_code());
+  EXPECT_EQ(200, checkResult.check_status().http().status_code());
+}
+
+
+// These are protobuf validation tests.
+//
+// TODO(alexr): Move these tests once validation code is moved closer to
+// protobuf definitions.
 
 // This tests ensures `CheckInfo` protobuf is validated correctly.
 TEST_F(CheckTest, CheckInfoValidation)
