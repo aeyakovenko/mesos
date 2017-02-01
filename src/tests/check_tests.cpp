@@ -769,6 +769,133 @@ TEST_F(CheckTest, CommandExecutorHTTPCheckDelivered)
 }
 
 
+// These are check tests with the default executor.
+//
+// TODO(alexr): Implement following tests once the default executor supports
+// command checks.
+//
+// 1. COMMAND check with env var works, is delivered, and is reconciled
+//    properly.
+// 2. COMMAND check's status change is delivered. TODO(alexr): When check
+//    mocking is available, ensure only status changes are delivered.
+// 3. COMMAND check times out.
+// 4. COMMAND check and health check do not shadow each other; upon
+//    reconciliation both statuses are available.
+
+// Verifies that an http check is supported by the default executor and
+// its status is delivered in a task status update.
+TEST_F(CheckTest, DefaultExecutorHTTPCheckDelivered)
+{
+  const Resources resources =
+    Resources::parse("cpus:0.1;mem:128;disk:128").get();
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // Disable AuthN on the agent.
+  slave::Flags flags = CreateSlaveFlags();
+  flags.authenticate_http_readwrite = false;
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), flags);
+  ASSERT_SOME(agent);
+
+  v1::FrameworkInfo frameworkInfo = evolve(DEFAULT_FRAMEWORK_INFO);
+
+  v1::ExecutorInfo executorInfo;
+  executorInfo.set_type(v1::ExecutorInfo::DEFAULT);
+  executorInfo.mutable_executor_id()->CopyFrom(evolve(DEFAULT_EXECUTOR_ID));
+  executorInfo.mutable_resources()->CopyFrom(evolve(resources));
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(connected);
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  callSubscribe(&mesos, frameworkInfo);
+
+  AWAIT_READY(subscribed);
+
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  // Update `executorInfo` with the subscribed `frameworkId`.
+  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0, offers->offers().size());
+
+  Future<v1::scheduler::Event::Update> updateTaskRunning;
+  Future<v1::scheduler::Event::Update> updateCheckResult;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&updateTaskRunning))
+    .WillOnce(FutureArg<1>(&updateCheckResult))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
+
+  const v1::Offer& offer = offers->offers(0);
+  const SlaveID agentId = devolve(offer.agent_id());
+
+  const uint16_t testPort = getFreePort().get();
+
+  // Use `test-helper` to launch a simple HTTP
+  // server to respond to HTTP checks.
+  const string command = strings::format(
+      "%s %s --ip=127.0.0.1 --port=%u",
+      getTestHelperPath("test-helper"),
+      HealthCheckTestHelper::NAME,
+      testPort).get();
+
+  v1::TaskInfo taskInfo = evolve(createTask(agentId, resources, command));
+
+  v1::CheckInfo* checkInfo = taskInfo.mutable_check();
+  checkInfo->set_type(v1::CheckInfo::HTTP);
+  checkInfo->mutable_http()->set_port(testPort);
+  checkInfo->mutable_http()->set_path("/help");
+  checkInfo->set_delay_seconds(0);
+  checkInfo->set_interval_seconds(0);
+
+  v1::TaskGroupInfo taskGroup;
+  taskGroup.add_tasks()->CopyFrom(taskInfo);
+
+  callLaunchTaskGroup(&mesos, offer, executorInfo, taskGroup);
+
+  AWAIT_READY(updateTaskRunning);
+  ASSERT_EQ(TASK_RUNNING, updateTaskRunning->status().state());
+  EXPECT_EQ(taskInfo.task_id(), updateTaskRunning->status().task_id());
+
+  // Acknowledge (to be able to get the next update).
+  callAcknowledge(&mesos, frameworkId, updateTaskRunning->status());
+
+  AWAIT_READY(updateCheckResult);
+  const auto& checkResult = updateCheckResult->status();
+
+  ASSERT_EQ(TASK_RUNNING, checkResult.state());
+  EXPECT_EQ(taskInfo.task_id(), checkResult.task_id());
+  EXPECT_TRUE(checkResult.has_check_status());
+  EXPECT_TRUE(checkResult.check_status().http().has_status_code());
+  EXPECT_EQ(200, checkResult.check_status().http().status_code());
+}
+
+
 // These are protobuf validation tests.
 //
 // TODO(alexr): Move these tests once validation code is moved closer to
