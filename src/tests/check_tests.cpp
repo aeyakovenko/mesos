@@ -33,12 +33,20 @@
 
 #include "checks/checker.hpp"
 
+#include "slave/slave.hpp"
+
+#include "slave/containerizer/fetcher.hpp"
+
 #include "tests/flags.hpp"
 #include "tests/health_check_test_helper.hpp"
 #include "tests/mesos.hpp"
 #include "tests/utils.hpp"
 
 using mesos::master::detector::MasterDetector;
+
+using mesos::internal::slave::Containerizer;
+using mesos::internal::slave::Fetcher;
+using mesos::internal::slave::MesosContainerizer;
 
 using mesos::v1::scheduler::Call;
 using mesos::v1::scheduler::Event;
@@ -794,6 +802,177 @@ TEST_F(CheckTest, CommandExecutorHTTPCheckDelivered)
 // 3. COMMAND check times out.
 // 4. COMMAND check and health check do not shadow each other; upon
 //    reconciliation both statuses are available.
+
+// Verifies that a command check is supported by the default executor,
+// its status is delivered in a task status update, and the last known
+// status can be obtained during explicit and implicit reconciliation.
+// Additionally ensures that the specified environment of the command
+// check is honored.
+//
+// TODO(alexr): Verify that an empty check status is included in every
+// non-terminal status update when no check result is available (yet).
+TEST_F(CheckTest, DefaultExecutorCommandCheckDeliveredAndReconciled)
+{
+  const Resources resources =
+    Resources::parse("cpus:0.1;mem:128;disk:128").get();
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // Disable AuthN on the agent.
+  slave::Flags flags = CreateSlaveFlags();
+  flags.authenticate_http_readwrite = false;
+
+  Fetcher fetcher;
+
+  Try<MesosContainerizer*> _containerizer =
+    MesosContainerizer::create(flags, false, &fetcher);
+
+  ASSERT_SOME(_containerizer);
+
+  Owned<slave::Containerizer> containerizer(_containerizer.get());
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> agent =
+    StartSlave(detector.get(), containerizer.get(), flags);
+  ASSERT_SOME(agent);
+
+  v1::FrameworkInfo frameworkInfo = evolve(DEFAULT_FRAMEWORK_INFO);
+
+  v1::ExecutorInfo executorInfo;
+  executorInfo.set_type(v1::ExecutorInfo::DEFAULT);
+  executorInfo.mutable_executor_id()->CopyFrom(evolve(DEFAULT_EXECUTOR_ID));
+  executorInfo.mutable_resources()->CopyFrom(evolve(resources));
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(connected);
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  callSubscribe(&mesos, frameworkInfo);
+
+  AWAIT_READY(subscribed);
+
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  // Update `executorInfo` with the subscribed `frameworkId`.
+  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0, offers->offers().size());
+
+  Future<Event::Update> updateTaskRunning;
+  Future<Event::Update> updateCheckResult;
+  Future<Event::Update> updateExplicitReconciliation;
+  Future<Event::Update> updateImplicitReconciliation;
+
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&updateTaskRunning))
+    .WillOnce(FutureArg<1>(&updateCheckResult))
+    .WillOnce(FutureArg<1>(&updateExplicitReconciliation))
+    .WillOnce(FutureArg<1>(&updateImplicitReconciliation))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
+
+  const v1::Offer& offer = offers->offers(0);
+  const SlaveID agentId = devolve(offer.agent_id());
+
+  v1::TaskInfo taskInfo = evolve(
+      createTask(agentId, resources, SLEEP_COMMAND(10000)));
+
+  v1::CheckInfo* checkInfo = taskInfo.mutable_check();
+  checkInfo->set_type(v1::CheckInfo::COMMAND);
+  checkInfo->set_delay_seconds(0);
+  checkInfo->set_interval_seconds(0);
+
+  v1::CommandInfo* checkCommand =
+    checkInfo->mutable_command()->mutable_command();
+  checkCommand->set_value("exit $STATUS");
+
+  v1::Environment::Variable* exitStatusVar =
+    checkCommand->mutable_environment()->add_variables();
+  exitStatusVar->set_name("STATUS");
+  exitStatusVar->set_value("1");
+
+  v1::TaskGroupInfo taskGroup;
+  taskGroup.add_tasks()->CopyFrom(taskInfo);
+
+  callLaunchTaskGroup(&mesos, offer, executorInfo, taskGroup);
+
+  AWAIT_READY(updateTaskRunning);
+  ASSERT_EQ(TASK_RUNNING, updateTaskRunning->status().state());
+  EXPECT_EQ(taskInfo.task_id(), updateTaskRunning->status().task_id());
+
+  callAcknowledge(&mesos, frameworkId, updateTaskRunning->status());
+
+  AWAIT_READY(updateCheckResult);
+  const auto& checkResult = updateCheckResult->status();
+
+  ASSERT_EQ(TASK_RUNNING, checkResult.state());
+  EXPECT_EQ(taskInfo.task_id(), checkResult.task_id());
+  EXPECT_TRUE(checkResult.has_check_status());
+  EXPECT_TRUE(checkResult.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      1,
+      checkResult.check_status().command().exit_code());
+
+  callAcknowledge(&mesos, frameworkId, checkResult);
+
+  // Trigger explicit reconciliation.
+  callReconcile(
+      &mesos,
+      frameworkId,
+      {std::make_pair(checkResult.task_id(), checkResult.agent_id())});
+
+  AWAIT_READY(updateExplicitReconciliation);
+
+  const auto& explicitReconciliation = updateExplicitReconciliation->status();
+  ASSERT_EQ(TASK_RUNNING, explicitReconciliation.state());
+  ASSERT_EQ(TaskStatus::REASON_RECONCILIATION, explicitReconciliation.reason());
+  EXPECT_EQ(taskInfo.task_id(), explicitReconciliation.task_id());
+  EXPECT_TRUE(explicitReconciliation.has_check_status());
+  EXPECT_TRUE(explicitReconciliation.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      1,
+      explicitReconciliation.check_status().command().exit_code());
+
+  callAcknowledge(&mesos, frameworkId, explicitReconciliation);
+
+  // Trigger implicit reconciliation.
+  callReconcile(&mesos, frameworkId, {});
+
+  AWAIT_READY(updateImplicitReconciliation);
+
+  const auto& implicitReconciliation = updateImplicitReconciliation->status();
+  ASSERT_EQ(TASK_RUNNING, implicitReconciliation.state());
+  ASSERT_EQ(TaskStatus::REASON_RECONCILIATION, implicitReconciliation.reason());
+  EXPECT_EQ(taskInfo.task_id(), implicitReconciliation.task_id());
+  EXPECT_TRUE(implicitReconciliation.has_check_status());
+  EXPECT_TRUE(implicitReconciliation.check_status().command().has_exit_code());
+  EXPECT_WEXITSTATUS_EQ(
+      1,
+      implicitReconciliation.check_status().command().exit_code());
+}
 
 // Verifies that an http check is supported by the default executor and
 // its status is delivered in a task status update.

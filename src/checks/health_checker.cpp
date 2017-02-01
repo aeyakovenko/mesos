@@ -28,6 +28,7 @@
 #include <vector>
 
 #include <mesos/mesos.hpp>
+#include <mesos/type_utils.hpp>
 
 #include <mesos/agent/agent.hpp>
 
@@ -51,11 +52,11 @@
 
 #include <stout/os/killtree.hpp>
 
+#include "checks/utils.hpp"
+
 #include "common/http.hpp"
 #include "common/status_utils.hpp"
 #include "common/validation.hpp"
-
-#include "internal/evolve.hpp"
 
 #ifdef __linux__
 #include "linux/ns.hpp"
@@ -125,39 +126,6 @@ static pid_t cloneWithSetns(
   });
 }
 #endif
-
-
-inline process::http::Request createRequest(
-    const process::http::URL& url,
-    const agent::Call& call)
-{
-  process::http::Request request;
-  request.method = "POST";
-  request.url = url;
-  request.body = serialize(ContentType::PROTOBUF, evolve(call));
-  request.keepAlive = false;
-  request.headers = {{"Accept", stringify(ContentType::PROTOBUF)},
-                     {"Content-Type", stringify(ContentType::PROTOBUF)}};
-
-  return request;
-}
-
-
-inline Future<Response> post(
-    const process::http::URL& url,
-    const agent::Call& call)
-{
-  return process::http::request(createRequest(url, call), false);
-}
-
-
-Future<Response> post(
-    Connection& connection,
-    const process::http::URL& url,
-    const agent::Call& call)
-{
-  return connection.send(createRequest(url, call), false);
-}
 
 
 Try<Owned<HealthChecker>> HealthChecker::create(

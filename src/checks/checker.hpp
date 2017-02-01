@@ -51,6 +51,9 @@ public:
    * Attempts to create a `Checker` object. In case of success, checking
    * starts immediately after initialization.
    *
+   * If the check is a command check, the checker will fork a process,
+   * enter the task's namespaces, and execute the commmand.
+   *
    * @param check The protobuf message definition of a check.
    * @param callback A callback `Checker` uses to send check status updates
    *     to its owner (usually an executor).
@@ -70,6 +73,35 @@ public:
       const TaskID& taskID,
       Option<pid_t> taskPid,
       const std::vector<std::string>& namespaces);
+
+  /**
+   * Attempts to create a `Checker` object. In case of success, checking
+   * starts immediately after initialization.
+   *
+   * If the check is a command check, the checker will delegate the
+   * execution of the check to the Mesos agent via the
+   * `LaunchNestedContainerSession` API call.
+   *
+   * @param check The protobuf message definition of a check.
+   * @param callback A callback `Checker` uses to send check status updates
+   *     to its owner (usually an executor).
+   * @param taskID The TaskID of the target task.
+   * @param taskContainerId The ContainerID of the target task.
+   * @param agentURL The URL of the agent.
+   * @param taskEnv The env of the target task.
+   * @return A `Checker` object or an error if `create` fails.
+   *
+   * @todo A better approach would be to return a stream of updates, e.g.,
+   * `process::Stream<TaskHealthStatus>` rather than invoking a callback.
+   */
+  static Try<process::Owned<Checker>> create(
+      const CheckInfo& checkInfo,
+      const lambda::function<
+        void(const TaskID&, const CheckStatusInfo&)>& callback,
+      const TaskID& taskId,
+      const ContainerID& taskContainerId,
+      const process::http::URL& agentURL,
+      const Option<Environment>& taskEnv);
 
   ~Checker();
 
@@ -94,7 +126,11 @@ public:
         void(const TaskID&, const CheckStatusInfo&)>& _callback,
       const TaskID& _taskID,
       Option<pid_t> _taskPid,
-      const std::vector<std::string>& _namespaces);
+      const std::vector<std::string>& _namespaces,
+      const Option<ContainerID>& _taskContainerId,
+      const Option<process::http::URL>& _agentURL,
+      const Option<Environment>& _taskEnv,
+      bool _agentSpawnsCommandContainer);
 
   virtual ~CheckerProcess() {}
 
@@ -112,6 +148,23 @@ private:
   void processCommandCheckResult(
       const Stopwatch& stopwatch,
       const process::Future<int>& result);
+
+  process::Future<int> nestedCommandCheck();
+
+  process::Future<int> _nestedCommandCheck(
+      process::http::Connection connection);
+
+  process::Future<int> __nestedCommandCheck(
+      const ContainerID& checkContainerId,
+      const process::http::Response& launchResponse);
+
+  process::Future<process::http::Response> nestedCommandCheckTimedOut(
+      const ContainerID& checkContainerId,
+      process::http::Connection connection,
+      process::Future<process::http::Response> future);
+
+  process::Future<Option<int>> waitForNestedContainer(
+      const ContainerID& containerId);
 
   process::Future<int> httpCheck();
   process::Future<int> _httpCheck(
@@ -133,6 +186,11 @@ private:
   const TaskID taskID;
   const Option<pid_t> taskPid;
   const std::vector<std::string> namespaces;
+  const Option<ContainerID> taskContainerId;
+  const Option<process::http::URL> agentURL;
+  const Option<Environment> taskEnv;
+  const bool agentSpawnsCommandContainer;
+
   Option<lambda::function<pid_t(const lambda::function<int()>&)>> clone;
 
   process::Time startTime;

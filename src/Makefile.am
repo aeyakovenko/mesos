@@ -834,6 +834,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   authorizer/local/authorizer.cpp					\
   checks/checker.cpp							\
   checks/health_checker.cpp						\
+  checks/utils.cpp							\
   common/attributes.cpp							\
   common/command_utils.cpp						\
   common/http.cpp							\
@@ -962,6 +963,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   authorizer/local/authorizer.hpp					\
   checks/checker.hpp							\
   checks/health_checker.hpp						\
+  checks/utils.hpp							\
   common/build.hpp							\
   common/command_utils.hpp						\
   common/http.hpp							\

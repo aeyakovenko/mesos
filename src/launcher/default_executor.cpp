@@ -405,17 +405,20 @@ protected:
       pending.pop_front();
 
       if (task.has_check()) {
-        // TODO(alexr): Add support for command checks.
-        CHECK_NE(CheckInfo::COMMAND, task.check().type())
-          << "Command checks are not supported yet";
+        Option<Environment> env;
+
+        if (task.has_command() && task.command().has_environment()) {
+          env = task.command().environment();
+        }
 
         Try<Owned<checks::Checker>> _checker =
           checks::Checker::create(
               task.check(),
               defer(self(), &Self::taskCheckUpdated, lambda::_1, lambda::_2),
               taskId,
-              None(),
-              vector<string>());
+              containerId,
+              agent,
+              env);
 
         if (_checker.isError()) {
           // TODO(anand): Should we send a TASK_FAILED instead?

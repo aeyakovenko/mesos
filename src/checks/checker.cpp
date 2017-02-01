@@ -26,10 +26,13 @@
 #include <mesos/mesos.hpp>
 #include <mesos/type_utils.hpp>
 
+#include <mesos/agent/agent.hpp>
+
 #include <process/clock.hpp>
 #include <process/collect.hpp>
 #include <process/defer.hpp>
 #include <process/delay.hpp>
+#include <process/http.hpp>
 #include <process/io.hpp>
 #include <process/subprocess.hpp>
 
@@ -47,6 +50,9 @@
 #include <stout/os/environment.hpp>
 #include <stout/os/killtree.hpp>
 
+#include "checks/utils.hpp"
+
+#include "common/http.hpp"
 #include "common/status_utils.hpp"
 #include "common/validation.hpp"
 
@@ -59,6 +65,9 @@ using process::Failure;
 using process::Future;
 using process::Owned;
 using process::Subprocess;
+
+using process::http::Connection;
+using process::http::Response;
 
 using std::map;
 using std::string;
@@ -112,6 +121,55 @@ static pid_t cloneWithSetns(
 #endif
 
 
+// FIXME(gkleiman): remove these forward declarations and move the helpers to a
+// better place.
+
+process::http::Request createRequest(
+    const process::http::URL& url,
+    const agent::Call& call);
+
+
+Future<Response> post(
+    const process::http::URL& url,
+    const agent::Call& call);
+
+
+Future<Response> post(
+    Connection& connection,
+    const process::http::URL& url,
+    const agent::Call& call);
+
+
+Try<Owned<Checker>> Checker::create(
+    const CheckInfo& check,
+    const lambda::function<
+      void(const TaskID&, const CheckStatusInfo&)>& callback,
+    const TaskID& taskID,
+    const ContainerID& taskContainerId,
+    const process::http::URL& agentURL,
+    const Option<Environment>& taskEnv)
+{
+  // Validate the `Check`Info` protobuf.
+  Option<Error> error = validation::checkInfo(check);
+  if (error.isSome()) {
+    return error.get();
+  }
+
+  Owned<CheckerProcess> process(new CheckerProcess(
+      check,
+      callback,
+      taskID,
+      None(),
+      vector<string>(),
+      taskContainerId,
+      agentURL,
+      taskEnv,
+      true));
+
+  return Owned<Checker>(new Checker(process));
+}
+
+
 Try<Owned<Checker>> Checker::create(
     const CheckInfo& check,
     const lambda::function<
@@ -131,7 +189,11 @@ Try<Owned<Checker>> Checker::create(
       callback,
       taskID,
       taskPid,
-      namespaces));
+      namespaces,
+      None(),
+      None(),
+      None(),
+      false));
 
   return Owned<Checker>(new Checker(process));
 }
@@ -166,13 +228,21 @@ CheckerProcess::CheckerProcess(
       void(const TaskID&, const CheckStatusInfo&)>& _callback,
     const TaskID& _taskID,
     Option<pid_t> _taskPid,
-    const vector<string>& _namespaces)
+    const vector<string>& _namespaces,
+    const Option<ContainerID>& _taskContainerId,
+    const Option<process::http::URL>& _agentURL,
+    const Option<Environment>& _taskEnv,
+    bool _agentSpawnsCommandContainer)
   : ProcessBase(process::ID::generate("checker")),
     check(_check),
     updateCallback(_callback),
     taskID(_taskID),
     taskPid(_taskPid),
-    namespaces(_namespaces)
+    namespaces(_namespaces),
+    taskContainerId(_taskContainerId),
+    agentURL(_agentURL),
+    taskEnv(_taskEnv),
+    agentSpawnsCommandContainer(_agentSpawnsCommandContainer)
 {
   Try<Duration> create = Duration::create(check.delay_seconds());
   CHECK_SOME(create);
@@ -233,7 +303,15 @@ void CheckerProcess::performSingleCheck()
 
   switch (check.type()) {
     case CheckInfo::COMMAND: {
-      commandCheck().onAny(defer(
+      Future<int> checkResult;
+
+      if (agentSpawnsCommandContainer) {
+        checkResult = nestedCommandCheck();
+      } else {
+        checkResult = commandCheck();
+      }
+
+      checkResult.onAny(defer(
           self(),
           &Self::processCommandCheckResult, stopwatch, lambda::_1));
       break;
@@ -388,6 +466,157 @@ void CheckerProcess::processCommandCheckResult(
   }
 
   processCheckResult(stopwatch, checkStatusInfo);
+}
+
+
+Future<int> CheckerProcess::nestedCommandCheck()
+{
+  CHECK_EQ(CheckInfo::COMMAND, check.type());
+  CHECK(check.has_command());
+  CHECK(taskContainerId.isSome());
+  CHECK(agentURL.isSome());
+
+  return process::http::connect(agentURL.get())
+    .repair([](const Future<Connection>& future) {
+      return Failure(
+          "Unable to establish connection with the agent: " + future.failure());
+    })
+    .then(defer(self(), &Self::_nestedCommandCheck, lambda::_1));
+}
+
+
+Future<int> CheckerProcess::_nestedCommandCheck(
+    Connection connection)
+{
+  ContainerID checkContainerId;
+  checkContainerId.set_value(taskContainerId.get().value() + "--check");
+  checkContainerId.mutable_parent()->CopyFrom(taskContainerId.get());
+
+  CommandInfo command(check.command().command());
+
+  if (taskEnv.isSome()) {
+    // Merge the task and the check environments. The environment of
+    // the check takes precedence over the one of the task.
+    //
+    // TODO(gkleiman): This only merges the Task env as described by the
+    // framework, but the actual env might be different. A better approach
+    // would be to make the agent copy the env of the parent container.
+    // See MESOS-6782.
+
+    map<string, string> env;
+
+    foreach (const Environment::Variable& variable, taskEnv->variables()) {
+      env[variable.name()] = variable.value();
+    }
+
+    foreach (
+        const Environment::Variable& variable,
+        check.command().command().environment().variables()) {
+      env[variable.name()] = variable.value();
+    }
+
+    command.clear_environment();
+    foreachpair (const string& name, const string& value, env) {
+      Environment::Variable* variable =
+        command.mutable_environment()->mutable_variables()->Add();
+      variable->set_name(name);
+      variable->set_value(value);
+    }
+  }
+
+  agent::Call call;
+  call.set_type(agent::Call::LAUNCH_NESTED_CONTAINER_SESSION);
+
+  agent::Call::LaunchNestedContainerSession* launch =
+    call.mutable_launch_nested_container_session();
+
+  launch->mutable_container_id()->CopyFrom(checkContainerId);
+  launch->mutable_command()->CopyFrom(command);
+
+  return post(connection, agentURL.get(), call)
+    .after(checkTimeout,
+           defer(self(),
+                 &Self::nestedCommandCheckTimedOut,
+                 checkContainerId,
+                 connection,
+                 lambda::_1))
+    .then(defer(self(),
+          &Self::__nestedCommandCheck,
+          checkContainerId,
+          lambda::_1));
+}
+
+
+Future<int> CheckerProcess::__nestedCommandCheck(
+    const ContainerID& checkContainerId,
+    const Response& launchResponse)
+{
+  if (launchResponse.code != process::http::Status::OK) {
+    return Failure(
+        "Received '" + launchResponse.status + "' (" + launchResponse.body +
+        ") while launching command check in a child container");
+  }
+
+  return waitForNestedContainer(checkContainerId)
+    .then([](const Option<int> status) -> Future<int> {
+      if (status.isNone()) {
+        return Failure("Command exit code not available");
+      } else {
+        return status.get();
+      }
+    });
+}
+
+
+Future<Response>
+CheckerProcess::nestedCommandCheckTimedOut(
+    const ContainerID& checkContainerId,
+    Connection connection,
+    Future<Response> future)
+{
+  future.discard();
+
+  // Closing the connection will make the agent kill the container.
+  connection.disconnect();
+
+  const Failure failure =
+    Failure("Command has not returned after " + stringify(checkTimeout));
+
+  return waitForNestedContainer(checkContainerId)
+    .repair([failure](const Future<Option<int>>& future) {
+        return failure;
+    })
+    .then([failure](const Option<int>& status) -> Future<Response> {
+        return failure;
+    });
+}
+
+
+Future<Option<int>> CheckerProcess::waitForNestedContainer(
+    const ContainerID& containerId)
+{
+  agent::Call call;
+  call.set_type(agent::Call::WAIT_NESTED_CONTAINER);
+
+  agent::Call::WaitNestedContainer* containerWait =
+    call.mutable_wait_nested_container();
+
+  containerWait->mutable_container_id()->CopyFrom(containerId);
+
+  return post(agentURL.get(), call)
+    .then([this](const Response& httpResponse) -> Future<Option<int>> {
+      if (httpResponse.code != process::http::Status::OK) {
+        return Failure(
+            "Received '" + httpResponse.status + "' (" + httpResponse.body +
+            ") waiting on check of task '" + stringify(taskID) + "'");
+      }
+
+      Try<agent::Response> response =
+        deserialize<agent::Response>(ContentType::PROTOBUF, httpResponse.body);
+      CHECK_SOME(response);
+
+      return response->wait_nested_container().exit_status();
+    });
 }
 
 
