@@ -161,7 +161,7 @@ Subprocess::ChildHook Subprocess::ChildHook::SUPERVISOR()
       return Error("Could not start supervisor process.");
     }
 
-    pid_t pid = fork();
+    pid_t pid = vfork();
     if (pid == -1) {
       return Error("Could not start supervisor process.");
     } else if (pid == 0) {
