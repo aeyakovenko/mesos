@@ -46,7 +46,7 @@ namespace process {
 
 inline pid_t defaultClone(const lambda::function<int()>& func)
 {
-  pid_t pid = ::fork();
+  pid_t pid = ::vfork();
   if (pid == -1) {
     return -1;
   } else if (pid == 0) {
